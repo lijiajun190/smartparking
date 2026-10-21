@@ -1,0 +1,676 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * File Name          : freertos.c
+  * Description        : Code for freertos applications
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "main.h"
+#include "cmsis_os.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include "app_events.h"
+#include "bsp_oled.h"
+#include "bsp_buzzer.h"
+#include "bsp_keys.h"
+#include "bsp_sensors.h"
+#include "bsp_rc522.h"
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/*
+ * 临时事件在 OLED 上的显示时间。
+ * 传感器触发后显示 SENS，超过该时间恢复 OK。
+ */
+#define UI_EVENT_HOLD_MS 1000U
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+/* USER CODE BEGIN Variables */
+/*应用事件队列*/
+osMessageQueueId_t appEventQueueHandle;
+
+/*蜂鸣器互斥锁，防止inputtask和safetask同时操作蜂鸣器*/
+osMutexId_t buzzerMutexHandle;
+
+/*三个基础任务句柄*/
+osThreadId_t uiTaskHandle;
+osThreadId_t inputTaskHandle;
+osThreadId_t safetyTaskHandle;
+osThreadId_t rfidTaskHandle;
+
+/* USER CODE END Variables */
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+/* Private function prototypes -----------------------------------------------*/
+/* USER CODE BEGIN FunctionPrototypes */
+
+/* 任务属性定义 */
+const osThreadAttr_t uiTask_attributes = {
+  .name = "UiTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+
+const osThreadAttr_t inputTask_attributes = {
+  .name = "InputTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+const osThreadAttr_t safetyTask_attributes = {
+  .name = "SafetyTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+
+const osThreadAttr_t rfidTask_attributes = {
+  .name = "RfidTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+
+/* 函数原型声明 */
+
+static void StartUiTask(void *argument);
+static void StartInputTask(void *argument);
+static void StartSafetyTask(void *argument);
+static void StartRfidTask(void *argument);
+
+static void app_post_event(AppEventType type, uint32_t value);
+static void app_post_card_event(const uint8_t *uid);
+
+static void buzzer_beep_short_safe(void);
+static void buzzer_beep_done_safe(void);
+static void buzzer_on_safe(void);
+static void buzzer_off_safe(void);
+/* USER CODE END FunctionPrototypes */
+
+void StartDefaultTask(void *argument);
+
+void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
+
+/* Hook prototypes */
+void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName);
+
+/* USER CODE BEGIN 4 */
+void vApplicationStackOverflowHook(xTaskHandle xTask, signed char *pcTaskName)
+{
+   /* Run time stack overflow checking is performed if
+   configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2. This hook function is
+   called if a stack overflow is detected. */
+}
+/* USER CODE END 4 */
+
+/**
+  * @brief  FreeRTOS initialization
+  * @param  None
+  * @retval None
+  */
+void MX_FREERTOS_Init(void) {
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /*
+   * 创建蜂鸣器互斥锁。
+   * 蜂鸣器可能同时被 InputTask 和 SafetyTask 使用，
+   * 必须保证同一时刻只有一个任务操作它。
+   */
+  buzzerMutexHandle = osMutexNew(NULL);
+
+  if (buzzerMutexHandle == NULL) {
+      Error_Handler();
+  }
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /*
+   * 创建应用事件队列。
+   *
+   * 队列长度为 16，足够保存短时间内产生的按键、
+   * 传感器和急停事件。
+   */
+   appEventQueueHandle = 
+    osMessageQueueNew(16, sizeof(AppEvent), NULL);
+
+  if (appEventQueueHandle == NULL) {
+    Error_Handler();
+  }
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  //OLED显示任务
+  uiTaskHandle = osThreadNew(StartUiTask, NULL, &uiTask_attributes);
+
+  //按键扫描任务
+  inputTaskHandle = osThreadNew(StartInputTask, NULL, &inputTask_attributes);
+
+  //安全监控任务
+  safetyTaskHandle = osThreadNew(StartSafetyTask, NULL, &safetyTask_attributes);
+
+  // RFID 读卡任务
+  rfidTaskHandle = osThreadNew(StartRfidTask, NULL, &rfidTask_attributes);
+
+  if ((uiTaskHandle == NULL) || (inputTaskHandle == NULL) || (safetyTaskHandle == NULL) || (rfidTaskHandle == NULL))
+  {
+    Error_Handler();
+  }
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+}
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN StartDefaultTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartDefaultTask */
+}
+
+/* Private application code --------------------------------------------------*/
+/* USER CODE BEGIN Application */
+
+/*
+ *@brief向应用事件队列投递事件。
+ */
+static void app_post_event(AppEventType type, uint32_t value)
+{
+  AppEvent event;
+  if (appEventQueueHandle == NULL) {
+    return;
+  }
+
+  event.tick = HAL_GetTick();
+  event.type = type;
+  event.value = value;
+
+  //任务上下文使用普通的osMessageQueuePut,timeout设置为0，避免输入任务被队列阻塞
+  (void)osMessageQueuePut(appEventQueueHandle, &event, 0U, 0U);
+}
+
+/*
+ * @brief 投递 RFID 卡片事件到应用队列
+ * @param uid 4字节的卡片 UID
+ * @note  与普通事件不同，卡片事件需要携带完整的 UID 数据
+ */
+static void app_post_card_event(const uint8_t *uid)
+{
+    AppEvent event;
+
+    if ((appEventQueueHandle == NULL) || (uid == NULL))
+    {
+        return;
+    }
+
+    event.tick = HAL_GetTick();
+    event.type = APP_EVENT_CARD_DETECTED;
+    
+    /* 将 UID 复制到事件结构体 */
+    memcpy(event.uid, uid, 4);
+
+    /* value 字段打包 UID 的前 4 字节（可选，方便快速比较）
+     * 格式: [UID0][UID1][UID2][UID3] 高字节在前 */
+    event.value = ((uint32_t)uid[0] << 24) |
+                  ((uint32_t)uid[1] << 16) |
+                  ((uint32_t)uid[2] << 8)  |
+                  ((uint32_t)uid[3]);
+
+    /* 投递事件，超时设为 0 避免阻塞 RfidTask */
+    (void)osMessageQueuePut(appEventQueueHandle, &event, 0U, 0U);
+}
+
+//@brief加锁后发出短提示音
+static void buzzer_beep_short_safe(void)
+{
+  if (buzzerMutexHandle == NULL)
+  {
+    return;
+  }
+
+  if (osMutexAcquire(buzzerMutexHandle, osWaitForever) == osOK)
+  {
+    (void)buzzer_beep_short();
+    (void)osMutexRelease(buzzerMutexHandle);
+  }
+}
+
+//加锁后发出完成提示音
+static void buzzer_beep_done_safe(void)
+{
+  if (buzzerMutexHandle == NULL)
+  {
+    return;
+  }
+
+  if (osMutexAcquire(buzzerMutexHandle, osWaitForever) == osOK)
+  {
+    (void)buzzer_beep_done();
+    (void)osMutexRelease(buzzerMutexHandle);
+  }
+}
+
+//加锁后打开蜂鸣器
+static void buzzer_on_safe(void)
+{
+  if (buzzerMutexHandle == NULL)
+    {
+        return;
+    }
+
+    if (osMutexAcquire(buzzerMutexHandle, osWaitForever) == osOK)
+    {
+        (void)buzzer_on();
+        (void)osMutexRelease(buzzerMutexHandle);
+    }
+}
+
+//加锁后关闭蜂鸣器
+static void buzzer_off_safe(void)
+{
+    if (buzzerMutexHandle == NULL)
+    {
+        return;
+    }
+
+    if (osMutexAcquire(buzzerMutexHandle, osWaitForever) == osOK)
+    {
+        (void)buzzer_off();
+        (void)osMutexRelease(buzzerMutexHandle);
+    }
+}
+
+//根据当前状态刷新oled
+static void ui_render(uint32_t sensor_state, AppEventType last_event, const uint8_t *last_uid)
+{
+  uint8_t ir1;
+  uint8_t ir2;
+  uint8_t limit1;
+  uint8_t limit2;
+  uint8_t emergency;
+
+  ir1       = (sensor_state & SENSOR_FLAG(SENSOR_IR_1)) ? 1U : 0U;
+  ir2       = (sensor_state & SENSOR_FLAG(SENSOR_IR_2)) ? 1U : 0U;
+  limit1    = (sensor_state & SENSOR_FLAG(SENSOR_LIMIT_1)) ? 1U : 0U;
+  limit2    = (sensor_state & SENSOR_FLAG(SENSOR_LIMIT_2)) ? 1U : 0U;
+  emergency = (sensor_state & SENSOR_FLAG(SENSOR_EMERGENCY)) ? 1U : 0U;
+
+  //当前oled最多显示四行，一行16字符
+  (void)OLED_Clear();
+
+    OLED_ShowString(1, 1, "Smart Parking");
+
+    OLED_ShowString(2, 1, "IR1:");
+    OLED_ShowNum(2, 5, ir1, 1);
+
+    OLED_ShowString(2, 8, "IR2:");
+    OLED_ShowNum(2, 12, ir2, 1);
+
+    OLED_ShowString(3, 1, "L1:");
+    OLED_ShowNum(3, 4, limit1, 1);
+
+    OLED_ShowString(3, 7, "L2:");
+    OLED_ShowNum(3, 10, limit2, 1);
+
+    OLED_ShowString(4, 1, "ESTOP:");
+    OLED_ShowNum(4, 7, emergency, 1);
+
+    /*
+     * 急停状态拥有最高显示优先级。
+     * 即使队列中随后收到 SENSOR_CHANGED，
+     * 也不能覆盖 STOP。
+     */
+    if (emergency != 0U)
+    {
+        OLED_ShowString(4, 10, "STOP");
+        return;
+    }
+
+    //当前阶段只显示最后一种事件，便于用OLED观察任务和队列是否工作
+    switch (last_event)
+    {
+      case APP_EVENT_KEY_PRESS: OLED_ShowString(4, 10, "KEY");
+      break;
+
+      case APP_EVENT_KEY_LONG_PRESS: OLED_ShowString(4, 10, "LONG");
+      break;
+
+      case APP_EVENT_SENSOR_CHANGED: OLED_ShowString(4, 10, "SENS");
+      break;
+
+      case APP_EVENT_EMERGENCY_ON: OLED_ShowString(4, 10, "STOP");
+      break;
+
+      case APP_EVENT_CARD_DETECTED:
+        /* 显示刷卡信息 - 简化版，只显示"CARD" */
+        OLED_ShowString(4, 10, "CARD");
+      break;
+
+      default: OLED_ShowString(4, 10, "OK");
+      break;
+    }
+}
+
+//OLED显示任务，唯一访问OLED，接收按键和传感器事件，周期性刷新传感器状态
+static void StartUiTask(void *argument)
+{
+  AppEvent event;
+  AppEventType last_event = APP_EVENT_NONE;
+  uint8_t last_uid[4] = {0};  /* 保存最后读取的卡片UID */
+
+  uint32_t sensor_state;
+  uint32_t last_sensor_state = 0U;
+  uint32_t last_event_tick = 0U;
+  uint8_t display_dirty = 1U;
+
+  (void)argument;
+
+  last_sensor_state = sensor_read_all();
+
+  for(;;)
+  {
+    //等待最多100ms事件，如果没有事件，也会继续执行下面的周期刷新
+    if(osMessageQueueGet(appEventQueueHandle, &event, NULL, 100U) == osOK)
+
+    {
+      last_event = event.type;
+      last_event_tick = HAL_GetTick();
+      display_dirty = 1U;
+
+      /* 如果是刷卡事件，保存UID */
+      if (event.type == APP_EVENT_CARD_DETECTED)
+      {
+          memcpy(last_uid, event.uid, 4);
+      }
+    }
+
+    sensor_state = sensor_read_all();
+
+    if (sensor_state != last_sensor_state)
+    {
+      last_sensor_state = sensor_state;
+      /*
+       * 急停状态优先级高于普通传感器变化。
+       */
+      if ((sensor_state & SENSOR_FLAG(SENSOR_EMERGENCY)) != 0U)
+      {
+          last_event = APP_EVENT_EMERGENCY_ON;
+      }
+      else
+      {
+          last_event = APP_EVENT_SENSOR_CHANGED;
+      }
+
+      last_event_tick = HAL_GetTick();
+      display_dirty = 1U;
+    }
+
+    /*
+     * 急停未激活时，临时事件显示超过 1 秒后恢复为 OK。
+     * 急停状态不在这里清除，由当前传感器状态决定。
+     */
+    if (((sensor_state & SENSOR_FLAG(SENSOR_EMERGENCY)) == 0U) &&
+        (last_event != APP_EVENT_NONE) &&
+        ((HAL_GetTick() - last_event_tick) >= UI_EVENT_HOLD_MS))
+    {
+        last_event = APP_EVENT_NONE;
+        display_dirty = 1U;
+    }
+
+    if (display_dirty != 0U)
+    {
+      ui_render(sensor_state, last_event, last_uid);
+      display_dirty = 0U;
+    }
+  }
+}
+
+//按键扫描任务，每10ms扫描一次PA0，并消抖
+static void StartInputTask(void *argument)
+{
+  KeyId key_id;
+  KeyEvent key_event;
+  AppEventType app_event_type;
+
+  (void)argument;
+
+  for(;;)
+  {
+    key_event = key_scan_all(&key_id);
+    app_event_type = APP_EVENT_NONE;
+
+    switch (key_event)
+    {
+      case KEY_EVENT_PRESS:
+      app_event_type = APP_EVENT_KEY_PRESS;
+      buzzer_beep_short_safe();
+      break;
+
+      case KEY_EVENT_RELEASE:
+      app_event_type = APP_EVENT_KEY_RELEASE;
+      break;
+
+      case KEY_EVENT_LONG_PRESS:
+      app_event_type = APP_EVENT_KEY_LONG_PRESS;
+      buzzer_beep_done_safe();
+      break;
+
+      default:
+      break;
+    }
+
+    if (app_event_type != APP_EVENT_NONE)
+    {
+      app_post_event(app_event_type, (uint32_t)key_id);
+    }
+
+    osDelay(KEY_SCAN_PERIOD_MS);
+  }
+}
+
+//安全监控；轮询急停，避免依赖EXTI2；读取传感器变化位图；急停时打开蜂鸣器；急停结束后关闭蜂鸣器
+static void StartSafetyTask(void *argument)
+{
+    uint8_t emergency_active;
+    uint8_t emergency_previous = 0U;
+    uint32_t changed_flags;
+
+    (void)argument;
+
+    //保存当前任务的原生Free RTOS句柄
+    sensor_set_notify_task((void *)xTaskGetCurrentTaskHandle());
+
+    for (; ;) 
+    {
+      //即使EXTI2没有触发，也通过轮询保证急停可用
+      emergency_active = sensor_emergency_active();
+
+      if((emergency_active != 0U) && (emergency_previous == 0U))
+      {
+        emergency_previous = 1U;
+        buzzer_on_safe();
+        app_post_event(APP_EVENT_EMERGENCY_ON, 1U);
+      }
+      else if((emergency_active == 0U) && (emergency_previous != 0U))
+      {
+        emergency_previous = 0U;
+        buzzer_off_safe();
+        app_post_event(APP_EVENT_EMERGENCY_OFF, 0U);
+      }
+      //读取并清除EXTI变化位图
+      changed_flags = sensor_take_changed_flags();
+
+      /*
+       * 急停由上面的 emergency_active 逻辑单独处理，
+       * 不再把急停变化作为普通传感器事件发送，
+       * 避免 SENSOR_CHANGED 覆盖急停事件。
+       */
+      changed_flags &= ~SENSOR_FLAG(SENSOR_EMERGENCY);
+
+      if(changed_flags != 0U)
+      {
+        app_post_event(APP_EVENT_SENSOR_CHANGED, changed_flags);
+      }
+
+      //使用任务通知实现20ms周期等待；如果EXTI中断发生，任务会被提前唤醒
+      (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20U));
+    }
+}    
+
+/**
+ * @brief  RFID 读卡任务
+ * @param  argument 未使用
+ * @note   任务职责:
+ *         1. 周期性扫描 RC522 读卡器
+ *         2. 检测到卡片后读取 UID
+ *         3. 通过去抖机制避免重复读取同一张卡
+ *         4. 将卡片事件投递到应用队列供 ParkingTask 处理
+ *         5. 发出提示音反馈用户
+ */
+static void StartRfidTask(void *argument)
+{
+    RC522_Status status;
+    uint8_t uid[4];
+    uint32_t scan_count = 0;        // 扫描计数器（用于调试）
+
+    (void)argument;
+
+    /* 延迟 100ms 等待系统稳定后再开始扫描 */
+    osDelay(100U);
+
+    printf("[RFID] Task started, begin scanning...\r\n");
+
+    for (;;)
+    {
+        scan_count++;
+
+        /* 每10次扫描输出一次心跳 */
+        if ((scan_count % 10) == 0)
+        {
+            printf("[RFID] Heartbeat: scan_count=%lu\r\n", scan_count);
+        }
+
+        /* 调用带去抖的读卡接口
+         * 去抖时间 500ms: 同一张卡在 500ms 内只触发一次事件 */
+        status = rc522_read_with_debounce(uid, 500U);
+
+        switch (status)
+        {
+            case RC522_OK:
+                /* 成功读取到新卡片（或同一卡片超过去抖时间） */
+                printf("[RFID] Card #%lu: %02X:%02X:%02X:%02X\r\n",
+                       scan_count, uid[0], uid[1], uid[2], uid[3]);
+
+                /* 投递卡片事件到应用队列 */
+                app_post_card_event(uid);
+
+                /* 发出短提示音，告知用户卡片已识别 */
+                buzzer_beep_short_safe();
+                break;
+
+            case RC522_NOTAG:
+                /* 无卡或在去抖时间内，正常情况，不做处理 */
+                break;
+
+            case RC522_ERR:
+                /* 通信错误（SPI 故障或 CRC 校验失败）
+                 * 偶尔出现可以忽略，频繁出现需要检查硬件连接 */
+                printf("[RFID] Read error\r\n");
+                break;
+
+            case RC522_COLLISION:
+                /* 多卡冲突（同时有多张卡在感应区）
+                 * 实际应用中很少见，可以提示用户一次只放一张卡 */
+                printf("[RFID] Card collision detected\r\n");
+                break;
+
+            case RC522_TIMEOUT:
+                /* 读卡超时（硬件可能异常）
+                 * 如果频繁出现，检查 RC522 电源和天线 */
+                printf("[RFID] Timeout\r\n");
+                break;
+
+            default:
+                break;
+        }
+
+        /* 每 150ms 扫描一次
+         *
+         * 扫描周期选择原则:
+         * - 太快 (< 50ms):  浪费 CPU，去抖机制会屏蔽大部分扫描
+         * - 太慢 (> 300ms): 用户刷卡后响应延迟明显
+         * - 推荐: 100-200ms，平衡响应速度和系统负载
+         *
+         * 当前设置 150ms 是经验值，可根据实际体验调整 */
+        osDelay(150U);
+    }
+}
+/* USER CODE END Application */
+

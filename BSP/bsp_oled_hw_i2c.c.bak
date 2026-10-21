@@ -1,0 +1,458 @@
+/**
+ * @file    bsp_oled.c
+ * @brief   STM32F411 OLED SSD1306 驱动实现 (I2C3)
+ * @note    使用 HAL 库 I2C3 接口，支持 128x64 分辨率
+ */
+
+#include "bsp_oled.h"
+#include "i2c.h"
+#include "oled_font.h"
+
+/**
+ * @brief 发送一条 SSD1306 命令
+ * @param command: 要发送的命令字节
+ * @retval HAL_StatusTypeDef: HAL 状态
+ * @note 控制字节 0x00 表示后续字节为命令
+ */
+static HAL_StatusTypeDef OLED_WriteCommand(uint8_t command)
+{
+    uint8_t transfer[2] = {0x00U, command};
+
+    return HAL_I2C_Master_Transmit(&hi2c3, OLED_I2C_ADDRESS, transfer,
+                                   sizeof(transfer), HAL_MAX_DELAY);
+}
+
+/**
+ * @brief 连续写入一段显存数据
+ * @param data: 数据缓冲区指针
+ * @param length: 数据长度，最大 OLED_WIDTH (128)
+ * @retval HAL_StatusTypeDef: HAL 状态
+ * @note OLED 的 I2C 数据包由 0x40 控制字节和后续显存数据组成。
+ *       一次发送一整段数据，比逐字节调用 HAL_I2C_Master_Transmit 快很多。
+ */
+static HAL_StatusTypeDef OLED_WriteDataBuffer(const uint8_t *data, uint16_t length)
+{
+    uint8_t transfer[OLED_WIDTH + 1U];
+
+    if ((data == NULL) || (length == 0U) || (length > OLED_WIDTH))
+    {
+        return HAL_ERROR;
+    }
+
+    transfer[0] = 0x40U; /* SSD1306 数据控制字节 */
+    for (uint16_t index = 0U; index < length; index++)
+    {
+        transfer[index + 1U] = data[index];
+    }
+
+    return HAL_I2C_Master_Transmit(&hi2c3, OLED_I2C_ADDRESS,
+                                   transfer, (uint16_t)(length + 1U), 100U);
+}
+
+/**
+ * @brief 设置 SSD1306 页地址和列地址
+ * @param page: 页地址 (0-7)
+ * @param column: 列地址 (0-127)
+ * @retval HAL_StatusTypeDef: HAL 状态
+ * @note 128x64 SSD1306 不使用 SH1106 的 2 列偏移
+ */
+static HAL_StatusTypeDef OLED_SetCursor(uint8_t page, uint8_t column)
+{
+    HAL_StatusTypeDef status;
+
+    /* 设置页地址 (0xB0-0xB7) */
+    status = OLED_WriteCommand((uint8_t)(0xB0U | page));
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    /* 设置列地址高 4 位 */
+    status = OLED_WriteCommand((uint8_t)(0x10U | ((column >> 4U) & 0x0FU)));
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    /* 设置列地址低 4 位 */
+    return OLED_WriteCommand((uint8_t)(column & 0x0FU));
+}
+
+/**
+ * @brief 计算无符号整数的整数次幂
+ * @param base: 底数
+ * @param exponent: 指数
+ * @retval uint32_t: base^exponent
+ */
+static uint32_t OLED_Pow(uint32_t base, uint32_t exponent)
+{
+    uint32_t result = 1U;
+
+    while (exponent-- > 0U)
+    {
+        result *= base;
+    }
+
+    return result;
+}
+
+/**
+ * @brief 初始化 SSD1306 128x64 OLED
+ * @retval HAL_StatusTypeDef: HAL 状态
+ * @note 使用标准初始化序列
+ */
+HAL_StatusTypeDef OLED_Init(void)
+{
+    /* SSD1306 标准初始化命令序列 */
+    static const uint8_t init_commands[] =
+    {
+        0xAEU,        /* 关闭显示 */
+        0xD5U, 0x80U, /* 设置显示时钟分频比 */
+        0xA8U, 0x3FU, /* 设置 64 路复用率 */
+        0xD3U, 0x00U, /* 设置显示偏移为 0 */
+        0x40U,        /* 设置起始显示行为第 0 行 */
+        0xA1U,        /* 设置左右方向（A0=正常，A1=翻转） */
+        0xC8U,        /* 设置上下方向（C0=正常，C8=翻转） */
+        0xDAU, 0x12U, /* 设置 COM 引脚硬件配置 */
+        0x81U, 0xCFU, /* 设置对比度 */
+        0xD9U, 0xF1U, /* 设置预充电周期 */
+        0xDBU, 0x30U, /* 设置 VCOMH 取消选择电平 */
+        0xA4U,        /* 使用显存内容显示（A4=正常，A5=全亮测试） */
+        0xA6U,        /* 正常显示，不反色（A6=正常，A7=反色） */
+        0x8DU, 0x14U, /* 开启内部电荷泵 */
+        0xAFU         /* 开启显示 */
+    };
+    HAL_StatusTypeDef status;
+    uint32_t index;
+
+    /* 等待 OLED 上电和内部电荷泵稳定 */
+    HAL_Delay(100U);
+
+    /* 发送初始化命令序列 */
+    for (index = 0U; index < sizeof(init_commands); index++)
+    {
+        status = OLED_WriteCommand(init_commands[index]);
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+    }
+
+    /* 初始化后清屏 */
+    return OLED_Clear();
+}
+
+/**
+ * @brief 全屏填充
+ * @param fill_data: 填充数据，0x00 为全黑，0xFF 为全亮
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_Fill(uint8_t fill_data)
+{
+    HAL_StatusTypeDef status;
+    uint8_t page;
+    uint8_t page_data[OLED_WIDTH];
+
+    /* 准备一整页相同数据 */
+    for (uint16_t index = 0U; index < OLED_WIDTH; index++)
+    {
+        page_data[index] = fill_data;
+    }
+
+    /* 逐页填充 */
+    for (page = 0U; page < OLED_PAGE_COUNT; page++)
+    {
+        status = OLED_SetCursor(page, 0U);
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+
+        status = OLED_WriteDataBuffer(page_data, OLED_WIDTH);
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+    }
+
+    return HAL_OK;
+}
+
+/**
+ * @brief 清除整个 OLED 显存（全黑）
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_Clear(void)
+{
+    return OLED_Fill(0x00U);
+}
+
+/**
+ * @brief 开启 OLED 显示
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_ON(void)
+{
+    HAL_StatusTypeDef status;
+
+    /* 开启电荷泵 */
+    status = OLED_WriteCommand(0x8DU);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    status = OLED_WriteCommand(0x14U);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    /* 开启显示 */
+    return OLED_WriteCommand(0xAFU);
+}
+
+/**
+ * @brief 关闭 OLED 显示
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_OFF(void)
+{
+    HAL_StatusTypeDef status;
+
+    /* 关闭电荷泵 */
+    status = OLED_WriteCommand(0x8DU);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    status = OLED_WriteCommand(0x10U);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    /* 关闭显示 */
+    return OLED_WriteCommand(0xAEU);
+}
+
+/**
+ * @brief 显示一个 8x16 ASCII 字符
+ * @param line: 行号，范围 1~4
+ * @param column: 列号，范围 1~16
+ * @param character: 要显示的字符
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_ShowChar(uint8_t line, uint8_t column, char character)
+{
+    HAL_StatusTypeDef status;
+    uint8_t font_index;
+
+    /* 参数检查 */
+    if ((line < 1U) || (line > 4U) || (column < 1U) || (column > 16U))
+    {
+        return HAL_ERROR;
+    }
+
+    /* 不可打印字符显示为 '?' */
+    if (((uint8_t)character < 0x20U) || ((uint8_t)character > 0x7EU))
+    {
+        character = '?';
+    }
+
+    /* 计算字模索引 */
+    font_index = (uint8_t)((uint8_t)character - 0x20U);
+
+    /* 显示字符上半部分（第1个页） */
+    status = OLED_SetCursor((uint8_t)((line - 1U) * 2U),
+                            (uint8_t)((column - 1U) * 8U + OLED_COLUMN_OFFSET));
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    status = OLED_WriteDataBuffer(OLED_F8x16[font_index], 8U);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    /* 显示字符下半部分（第2个页） */
+    status = OLED_SetCursor((uint8_t)((line - 1U) * 2U + 1U),
+                            (uint8_t)((column - 1U) * 8U + OLED_COLUMN_OFFSET));
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    status = OLED_WriteDataBuffer(&OLED_F8x16[font_index][8U], 8U);
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    return HAL_OK;
+}
+
+/**
+ * @brief 显示一个 8x16 ASCII 字符串
+ * @param line: 行号，范围 1~4
+ * @param column: 起始列号，范围 1~16
+ * @param text: 要显示的字符串
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_ShowString(uint8_t line, uint8_t column, const char *text)
+{
+    HAL_StatusTypeDef status;
+
+    if (text == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    /* 逐字符显示 */
+    while (*text != '\0')
+    {
+        if (column > 16U)
+        {
+            return HAL_ERROR;
+        }
+
+        status = OLED_ShowChar(line, column, *text);
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+
+        column++;
+        text++;
+    }
+
+    return HAL_OK;
+}
+
+/**
+ * @brief 显示无符号十进制数
+ * @param line: 行号，范围 1~4
+ * @param column: 起始列号，范围 1~16
+ * @param number: 要显示的数字
+ * @param length: 显示位数
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_ShowNum(uint8_t line, uint8_t column, uint32_t number, uint8_t length)
+{
+    HAL_StatusTypeDef status;
+    uint8_t index;
+
+    for (index = 0U; index < length; index++)
+    {
+        status = OLED_ShowChar(line, (uint8_t)(column + index),
+                               (char)(number / OLED_Pow(10U, length - index - 1U) % 10U + '0'));
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+    }
+
+    return HAL_OK;
+}
+
+/**
+ * @brief 显示有符号十进制数
+ * @param line: 行号，范围 1~4
+ * @param column: 起始列号，范围 1~16
+ * @param number: 要显示的数字
+ * @param length: 显示位数（不包括符号位）
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_ShowSignedNum(uint8_t line, uint8_t column, int32_t number, uint8_t length)
+{
+    HAL_StatusTypeDef status;
+    uint32_t magnitude;
+
+    /* 显示符号 */
+    status = OLED_ShowChar(line, column, (number >= 0) ? '+' : '-');
+    if (status != HAL_OK)
+    {
+        return status;
+    }
+
+    /* 用补码运算安全处理 INT32_MIN */
+    magnitude = (number >= 0) ? (uint32_t)number : (uint32_t)(-(number + 1)) + 1U;
+    return OLED_ShowNum(line, (uint8_t)(column + 1U), magnitude, length);
+}
+
+/**
+ * @brief 显示十六进制数
+ * @param line: 行号，范围 1~4
+ * @param column: 起始列号，范围 1~16
+ * @param number: 要显示的数字
+ * @param length: 显示位数
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_ShowHexNum(uint8_t line, uint8_t column, uint32_t number, uint8_t length)
+{
+    HAL_StatusTypeDef status;
+    uint8_t index;
+    uint8_t digit;
+
+    for (index = 0U; index < length; index++)
+    {
+        digit = (uint8_t)(number / OLED_Pow(16U, length - index - 1U) % 16U);
+        status = OLED_ShowChar(line, (uint8_t)(column + index),
+                               (char)((digit < 10U) ? (digit + '0') : (digit - 10U + 'A')));
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+    }
+
+    return HAL_OK;
+}
+
+/**
+ * @brief 显示二进制数
+ * @param line: 行号，范围 1~4
+ * @param column: 起始列号，范围 1~16
+ * @param number: 要显示的数字
+ * @param length: 显示位数
+ * @retval HAL_StatusTypeDef: HAL 状态
+ */
+HAL_StatusTypeDef OLED_ShowBinNum(uint8_t line, uint8_t column, uint32_t number, uint8_t length)
+{
+    HAL_StatusTypeDef status;
+    uint8_t index;
+
+    for (index = 0U; index < length; index++)
+    {
+        status = OLED_ShowChar(line, (uint8_t)(column + index),
+                               (char)(number / OLED_Pow(2U, length - index - 1U) % 2U + '0'));
+        if (status != HAL_OK)
+        {
+            return status;
+        }
+    }
+
+    return HAL_OK;
+}
+
+/**
+ * @brief 兼容旧版坐标式字符串显示接口
+ * @param x: X坐标（必须是8的倍数）
+ * @param page: 页地址（必须是2的倍数）
+ * @param text: 要显示的字符串
+ * @param text_size: 字体大小，当前只支持 2 (8x16)
+ * @retval HAL_StatusTypeDef: HAL 状态
+ * @note 当前字模文件只有 8x16 字体，因此 text_size 必须为 2
+ */
+HAL_StatusTypeDef OLED_ShowStr(uint8_t x, uint8_t page, const char *text, uint8_t text_size)
+{
+    if ((text_size != 2U) || ((x % 8U) != 0U) || ((page % 2U) != 0U))
+    {
+        return HAL_ERROR;
+    }
+
+    return OLED_ShowString((uint8_t)(page / 2U + 1U),
+                           (uint8_t)(x / 8U + 1U), text);
+}
